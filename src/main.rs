@@ -1,4 +1,5 @@
 use std::{
+    future::IntoFuture,
     io::{Cursor, Read},
     net::SocketAddr,
     path::PathBuf,
@@ -297,23 +298,20 @@ async fn start_jetstream(
     let mut ops = 0usize;
 
     let (bytes_tx, bytes_rx) =
-        tokio::sync::mpsc::channel::<Result<Vec<u8>, tokio_tungstenite::tungstenite::Error>>(100);
+        tokio::sync::mpsc::channel::<Result<Vec<u8>, tokio_tungstenite::tungstenite::Error>>(200);
 
     let (messages_tx, messages_rx) =
-        tokio::sync::mpsc::channel::<eyre::Result<TransformedMessage>>(100);
-    let mut messages_stream = ReceiverStream::new(messages_rx);
+        tokio::sync::mpsc::channel::<eyre::Result<TransformedMessage>>(200);
+    let messages_stream = ReceiverStream::new(messages_rx);
+    let chunked_messages_stream =
+        tokio_stream::StreamExt::chunks_timeout(messages_stream, 100, Duration::from_secs(1));
+    tokio::pin!(chunked_messages_stream);
 
-    stream_sender(stream, bytes_tx).await;
+    stream_sender(token, stream, bytes_tx).await;
     transform_thread(config.nats_stream_name.clone(), bytes_rx, messages_tx);
 
     loop {
         tokio::select! {
-            _ = token.cancelled() => {
-                info!(pos, "cancelled, committing cursor position and stopping");
-                bucket.put(&config.nats_cursor_key, pos.to_string().into()).await?;
-                break;
-            }
-
             _ = commit_ticker.tick() => {
                 debug!(pos, "committing cursor position");
                 bucket.put(&config.nats_cursor_key, pos.to_string().into()).await?;
@@ -330,24 +328,16 @@ async fn start_jetstream(
                 ops = 0;
             }
 
-            message = messages_stream.next() => {
-                MESSAGES_COUNTER.inc();
-                ops += 1;
+            messages = chunked_messages_stream.next() => {
+                match messages {
+                    Some(messages) => {
+                        let len = messages.len();
+                        trace!(len, "got chunk of messages");
 
-                match message {
-                    Some(Ok(TransformedMessage { time_us, data: Some((subject, headers, data)) })) => {
-                        pos = time_us;
+                        MESSAGES_COUNTER.inc_by(len as u64);
+                        ops += len;
 
-                        js.publish_with_headers(subject, headers, data.into()).await?.await?;
-                    }
-
-                    Some(Ok(_)) => {
-                        warn!("message could not extract data");
-                    }
-
-                    Some(Err(err)) => {
-                        error!("message transform stream error: {err}");
-                        break;
+                        handle_message_chunk(&js, &mut pos, messages).await?;
                     }
 
                     None => {
@@ -359,14 +349,52 @@ async fn start_jetstream(
         }
     }
 
+    info!(pos, "loop finished, saving cursor position");
+    bucket
+        .put(&config.nats_cursor_key, pos.to_string().into())
+        .await?;
+
+    Ok(())
+}
+
+async fn handle_message_chunk(
+    js: &async_nats::jetstream::Context,
+    pos: &mut u64,
+    messages: Vec<eyre::Result<TransformedMessage>>,
+) -> eyre::Result<()> {
+    let messages: Vec<TransformedMessage> = messages
+        .into_iter()
+        .collect::<eyre::Result<Vec<TransformedMessage>>>()?;
+
+    let mut futs = Vec::with_capacity(messages.len());
+    for message in messages {
+        if let Some((subject, headers, data)) = message.data {
+            let fut = js
+                .publish_with_headers(subject, headers, data.into())
+                .await?
+                .into_future();
+            futs.push(fut);
+        }
+
+        if message.time_us > *pos {
+            *pos = message.time_us;
+        }
+    }
+
+    futures::future::try_join_all(futs).await?;
+
     Ok(())
 }
 
 async fn stream_sender(
-    mut stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    token: CancellationToken,
+    stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
     tx: tokio::sync::mpsc::Sender<Result<Vec<u8>, tokio_tungstenite::tungstenite::Error>>,
 ) {
     tokio::spawn(async move {
+        let stream = stream.take_until(token.cancelled());
+        tokio::pin!(stream);
+
         while let Some(message) = stream.next().await {
             match message {
                 Ok(Message::Binary(data)) => {
