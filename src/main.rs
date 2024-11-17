@@ -1,16 +1,19 @@
-use std::{io::Cursor, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{future::IntoFuture, io::Cursor, net::SocketAddr, path::PathBuf, time::Duration};
 
-use async_nats::{HeaderMap, ServerAddr};
+use async_nats::{jetstream::context::PublishError, HeaderMap, ServerAddr};
 use axum::{routing::get, Router};
 use clap::Parser;
-use futures::StreamExt;
+use futures::{StreamExt, TryFutureExt};
 use lazy_static::lazy_static;
 use prometheus::{
     register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec, TextEncoder,
 };
 use serde::{Deserialize, Serialize};
 use tap::TapOptional;
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::{
+    signal::unix::{signal, SignalKind},
+    task::JoinHandle,
+};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, trace, warn};
@@ -279,12 +282,13 @@ async fn start_jetstream(
     )?;
     debug!(%url, "built final connection url");
 
+    let mut ticker = tokio::time::interval(Duration::from_secs(10));
+
     let (mut stream, _) = connect_async(url).await?;
     info!("connected to stream");
 
+    let mut pub_task: Option<JoinHandle<Result<(), PublishError>>> = None;
     let mut pos = cursor;
-
-    let mut ticker = tokio::time::interval(Duration::from_secs(10));
 
     loop {
         tokio::select! {
@@ -308,10 +312,15 @@ async fn start_jetstream(
                             Message::Binary(data) => {
                                 let message = transform_message(&config.nats_stream_name, &dict, data)?;
 
+                                if let Some(task) = pub_task.take() {
+                                    task.await??;
+                                }
+
                                 pos = message.time_us;
 
                                 if let Some((subject, headers, data)) = message.data {
-                                    js.publish_with_headers(subject, headers, data.into()).await?.await?;
+                                    let fut = js.publish_with_headers(subject, headers, data.into()).await?;
+                                    pub_task = Some(tokio::spawn(fut.into_future().map_ok(|_| ())));
                                 }
                             }
 
