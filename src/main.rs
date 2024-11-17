@@ -1,15 +1,14 @@
 use std::{
-    future::IntoFuture,
     io::{Cursor, Read},
     net::SocketAddr,
     path::PathBuf,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use async_nats::{jetstream::context::PublishError, HeaderMap, ServerAddr};
+use async_nats::{HeaderMap, ServerAddr};
 use axum::{routing::get, Router};
 use clap::Parser;
-use futures::{StreamExt, TryFutureExt};
+use futures::StreamExt;
 use lazy_static::lazy_static;
 use prometheus::{
     register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec, TextEncoder,
@@ -17,10 +16,12 @@ use prometheus::{
 use serde::{Deserialize, Serialize};
 use tap::TapOptional;
 use tokio::{
+    net::TcpStream,
     signal::unix::{signal, SignalKind},
-    task::JoinHandle,
+    time::interval,
 };
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, trace, warn};
 use url::Url;
@@ -261,8 +262,6 @@ async fn start_jetstream(
 ) -> eyre::Result<()> {
     info!("initializing jetstream connection");
 
-    let dict = DecoderDictionary::copy(ZSTD_DICTIONARY);
-
     let bucket = js.get_key_value(&config.nats_bucket_name).await?;
 
     let cursor = if let Some(cursor) = bucket.get(&config.nats_cursor_key).await? {
@@ -286,13 +285,26 @@ async fn start_jetstream(
     )?;
     debug!(%url, "built final connection url");
 
-    let mut ticker = tokio::time::interval(Duration::from_secs(10));
-
-    let (mut stream, _) = connect_async(url).await?;
+    let (stream, _) = connect_async(url).await?;
     info!("connected to stream");
 
-    let mut pub_task: Option<JoinHandle<Result<(), PublishError>>> = None;
+    let mut commit_ticker = interval(Duration::from_secs(10));
+
     let mut pos = cursor;
+
+    let mut perf_ticker = interval(Duration::from_secs(1));
+    let mut start = Instant::now();
+    let mut ops = 0usize;
+
+    let (bytes_tx, bytes_rx) =
+        tokio::sync::mpsc::channel::<Result<Vec<u8>, tokio_tungstenite::tungstenite::Error>>(100);
+
+    let (messages_tx, messages_rx) =
+        tokio::sync::mpsc::channel::<eyre::Result<TransformedMessage>>(100);
+    let mut messages_stream = ReceiverStream::new(messages_rx);
+
+    stream_sender(stream, bytes_tx).await;
+    transform_thread(config.nats_stream_name.clone(), bytes_rx, messages_tx);
 
     loop {
         tokio::select! {
@@ -302,45 +314,44 @@ async fn start_jetstream(
                 break;
             }
 
-            _ = ticker.tick() => {
+            _ = commit_ticker.tick() => {
                 debug!(pos, "committing cursor position");
                 bucket.put(&config.nats_cursor_key, pos.to_string().into()).await?;
             }
 
-            message = stream.next() => {
+            _ = perf_ticker.tick() => {
+                let now = Instant::now();
+                let elapsed = now - start;
+
+                let ops_per_s = ops as f64 / elapsed.as_secs_f64();
+                debug!(ops_per_s, "calculated operations");
+
+                start = now;
+                ops = 0;
+            }
+
+            message = messages_stream.next() => {
+                MESSAGES_COUNTER.inc();
+                ops += 1;
+
                 match message {
-                    Some(Ok(message)) => {
-                        MESSAGES_COUNTER.inc();
+                    Some(Ok(TransformedMessage { time_us, data: Some((subject, headers, data)) })) => {
+                        pos = time_us;
 
-                        match message {
-                            Message::Binary(data) => {
-                                let message = transform_message(&config.nats_stream_name, &dict, data)?;
+                        js.publish_with_headers(subject, headers, data.into()).await?.await?;
+                    }
 
-                                if let Some(task) = pub_task.take() {
-                                    task.await??;
-                                }
-
-                                pos = message.time_us;
-
-                                if let Some((subject, headers, data)) = message.data {
-                                    let fut = js.publish_with_headers(subject, headers, data.into()).await?;
-                                    pub_task = Some(tokio::spawn(fut.into_future().map_ok(|_| ())));
-                                }
-                            }
-
-                            message => {
-                                warn!("got unexpected message type: {message:?}");
-                            }
-                        }
+                    Some(Ok(_)) => {
+                        warn!("message could not extract data");
                     }
 
                     Some(Err(err)) => {
-                        error!("stream error: {err}");
+                        error!("message transform stream error: {err}");
                         break;
                     }
 
                     None => {
-                        warn!("stream ended");
+                        warn!("messages stream ended");
                         break;
                     }
                 }
@@ -349,6 +360,62 @@ async fn start_jetstream(
     }
 
     Ok(())
+}
+
+async fn stream_sender(
+    mut stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    tx: tokio::sync::mpsc::Sender<Result<Vec<u8>, tokio_tungstenite::tungstenite::Error>>,
+) {
+    tokio::spawn(async move {
+        while let Some(message) = stream.next().await {
+            match message {
+                Ok(Message::Binary(data)) => {
+                    tx.send(Ok(data)).await.expect("send should always succeed");
+                }
+
+                Ok(message) => {
+                    warn!("got unexpected message type: {message:?}");
+                }
+
+                Err(err) => {
+                    tx.send(Err(err)).await.expect("send should always succeed");
+                    break;
+                }
+            }
+        }
+
+        warn!("websocket stream ended");
+    });
+}
+
+fn transform_thread(
+    stream_name: String,
+    mut rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, tokio_tungstenite::tungstenite::Error>>,
+    tx: tokio::sync::mpsc::Sender<eyre::Result<TransformedMessage>>,
+) {
+    std::thread::spawn(move || {
+        let dict = DecoderDictionary::copy(ZSTD_DICTIONARY);
+
+        while let Some(msg) = rx.blocking_recv() {
+            match msg {
+                Ok(bytes) => {
+                    if let Err(err) =
+                        tx.blocking_send(transform_message(&stream_name, &dict, bytes))
+                    {
+                        error!("could not send transformed message: {err}");
+                        break;
+                    }
+                }
+
+                Err(err) => {
+                    error!("got websocket error: {err}");
+                    break;
+                }
+            }
+        }
+
+        warn!("transform thread ended");
+    });
 }
 
 struct TransformedMessage {

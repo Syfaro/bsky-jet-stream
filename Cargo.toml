@@ -18,6 +18,7 @@ serde = { version = "1.0.215", features = ["derive"] }
 serde_json = { version = "1.0.133", features = ["raw_value"] }
 tap = "1.0.1"
 tokio = { version = "1.41.1", features = ["rt-multi-thread", "macros", "signal"] }
+tokio-stream = "0.1.16"
 tokio-tungstenite = { version = "0.24.0", features = ["rustls-tls-webpki-roots", "connect", "url"] }
 tokio-util = "0.7.12"
 tracing = { version = "0.1.40", features = ["release_max_level_debug"] }
