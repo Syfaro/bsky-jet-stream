@@ -1,4 +1,10 @@
-use std::{future::IntoFuture, io::Cursor, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    future::IntoFuture,
+    io::{Cursor, Read},
+    net::SocketAddr,
+    path::PathBuf,
+    time::Duration,
+};
 
 use async_nats::{jetstream::context::PublishError, HeaderMap, ServerAddr};
 use axum::{routing::get, Router};
@@ -73,51 +79,49 @@ struct Config {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-struct JetstreamEvent {
+struct JetstreamEvent<'a> {
     did: String,
     time_us: u64,
-    #[serde(flatten)]
-    data: JetstreamEventData,
+    kind: JetstreamEventKind,
+    #[serde(borrow)]
+    commit: Option<JetstreamCommit<'a>>,
+    identity: Option<&'a serde_json::value::RawValue>,
+    account: Option<&'a serde_json::value::RawValue>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum JetstreamEventData {
-    Commit { commit: JetstreamCommit },
-    Identity { identity: JetstreamIdentity },
-    Account { account: JetstreamAccount },
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum JetstreamEventKind {
+    Commit,
+    Identity,
+    Account,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-struct JetstreamCommit {
+struct JetstreamCommit<'a> {
     rev: String,
+    operation: JetstreamCommitOperation,
     collection: String,
     rkey: String,
-    #[serde(flatten)]
-    data: JetstreamCommitData,
+    #[serde(borrow)]
+    record: Option<&'a serde_json::value::RawValue>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "operation", rename_all = "snake_case")]
-enum JetstreamCommitData {
-    Create {
-        record: serde_json::Value,
-        cid: String,
-    },
-    Update {
-        record: serde_json::Value,
-        cid: String,
-    },
+#[serde(rename_all = "snake_case")]
+enum JetstreamCommitOperation {
+    Create,
+    Update,
     Delete,
 }
 
-impl JetstreamCommit {
+impl JetstreamCommit<'_> {
     fn action(&self) -> &'static str {
-        match &self.data {
-            JetstreamCommitData::Create { .. } => "create",
-            JetstreamCommitData::Update { .. } => "update",
-            JetstreamCommitData::Delete => "delete",
+        match &self.operation {
+            JetstreamCommitOperation::Create => "create",
+            JetstreamCommitOperation::Update => "update",
+            JetstreamCommitOperation::Delete => "delete",
         }
     }
 }
@@ -359,8 +363,12 @@ fn transform_message(
     data: Vec<u8>,
 ) -> eyre::Result<TransformedMessage> {
     let cursor = Cursor::new(data);
-    let decoder = Decoder::with_prepared_dictionary(cursor, dict)?;
-    let event = serde_json::from_reader::<_, JetstreamEvent>(decoder)?;
+    let mut decoder = Decoder::with_prepared_dictionary(cursor, dict)?;
+
+    let mut buf = Vec::new();
+    decoder.read_to_end(&mut buf)?;
+
+    let event: JetstreamEvent = serde_json::from_slice(&buf)?;
 
     trace!(time_us = event.time_us, "got event: {event:?}");
 
@@ -368,8 +376,16 @@ fn transform_message(
     headers.insert("Nats-Expected-Stream", stream_name);
     headers.insert("Nats-Msg-Id", event.time_us.to_string());
 
-    let (subject, data): (String, Vec<u8>) = match event.data {
-        JetstreamEventData::Commit { commit } => {
+    let (subject, data): (String, Vec<u8>) = match event.kind {
+        JetstreamEventKind::Commit => {
+            let Some(commit) = event.commit else {
+                warn!("commit event without commit data");
+                return Ok(TransformedMessage {
+                    time_us: event.time_us,
+                    data: None,
+                });
+            };
+
             let action = commit.action();
 
             MESSAGE_KIND_COUNTER.with_label_values(&["commit"]).inc();
@@ -378,17 +394,11 @@ fn transform_message(
                 .with_label_values(&[action, &commit.collection])
                 .inc();
 
-            let value = match &commit.data {
-                JetstreamCommitData::Create { record, .. }
-                | JetstreamCommitData::Update { record, .. } => serde_json::to_value(record)?,
-                JetstreamCommitData::Delete => serde_json::Value::Null,
-            };
-
             let payload = serde_json::json!({
                 "repo": event.did,
                 "path": format!("{}/{}", commit.collection, commit.rkey),
                 "action": action,
-                "data": value,
+                "data": commit.record,
             });
 
             (
@@ -396,18 +406,21 @@ fn transform_message(
                 serde_json::to_vec(&payload)?,
             )
         }
-        JetstreamEventData::Identity { identity } => {
+        JetstreamEventKind::Identity => {
             MESSAGE_KIND_COUNTER.with_label_values(&["identity"]).inc();
 
             (
                 "bsky.ingest.identity".into(),
-                serde_json::to_vec(&identity)?,
+                serde_json::to_vec(&event.identity)?,
             )
         }
-        JetstreamEventData::Account { account } => {
+        JetstreamEventKind::Account => {
             MESSAGE_KIND_COUNTER.with_label_values(&["account"]).inc();
 
-            ("bsky.ingest.account".into(), serde_json::to_vec(&account)?)
+            (
+                "bsky.ingest.account".into(),
+                serde_json::to_vec(&event.account)?,
+            )
         }
     };
 
