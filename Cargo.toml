@@ -3,6 +3,7 @@ name = "bsky-jet-stream"
 version = "0.1.0"
 edition = "2021"
 authors = ["Syfaro <syfaro@huefox.com>"]
+publish = false
 
 [dependencies]
 async-nats = "0.37.0"
