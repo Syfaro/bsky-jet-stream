@@ -1,7 +1,6 @@
 use std::{io::Cursor, net::SocketAddr, path::PathBuf, time::Duration};
 
 use async_nats::{HeaderMap, ServerAddr};
-use atrium_api::types::string::{Cid, Did, Handle, Nsid, RecordKey};
 use axum::{routing::get, Router};
 use clap::Parser;
 use futures::StreamExt;
@@ -21,7 +20,7 @@ use zstd::{dict::DecoderDictionary, Decoder};
 const ZSTD_DICTIONARY: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/zstd/dictionary"));
 
-const REPLAY_WINDOW_NS: u64 = 5 * 10u64.pow(9);
+const REPLAY_WINDOW_NS: u64 = 5 * 10u64.pow(6);
 
 lazy_static! {
     static ref MESSAGES_COUNTER: IntCounter =
@@ -72,7 +71,7 @@ struct Config {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct JetstreamEvent {
-    did: Did,
+    did: String,
     time_us: u64,
     #[serde(flatten)]
     data: JetstreamEventData,
@@ -90,8 +89,8 @@ enum JetstreamEventData {
 #[serde(rename_all = "snake_case")]
 struct JetstreamCommit {
     rev: String,
-    collection: Nsid,
-    rkey: RecordKey,
+    collection: String,
+    rkey: String,
     #[serde(flatten)]
     data: JetstreamCommitData,
 }
@@ -99,8 +98,8 @@ struct JetstreamCommit {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 enum JetstreamCommitData {
-    Create { record: serde_json::Value, cid: Cid },
-    Update { record: serde_json::Value, cid: Cid },
+    Create { record: serde_json::Value, cid: String },
+    Update { record: serde_json::Value, cid: String },
     Delete,
 }
 
@@ -117,8 +116,8 @@ impl JetstreamCommit {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct JetstreamIdentity {
-    did: Did,
-    handle: Option<Handle>,
+    did: String,
+    handle: Option<String>,
     seq: u64,
     time: chrono::DateTime<chrono::Utc>,
 }
@@ -127,7 +126,7 @@ struct JetstreamIdentity {
 #[serde(rename_all = "snake_case")]
 struct JetstreamAccount {
     active: bool,
-    did: Did,
+    did: String,
     seq: u64,
     time: chrono::DateTime<chrono::Utc>,
     status: Option<AccountStatus>,
@@ -219,6 +218,8 @@ async fn metrics_server(token: CancellationToken, host: SocketAddr) -> eyre::Res
 async fn process(token: CancellationToken, js: async_nats::jetstream::Context, config: Config) {
     loop {
         tokio::select! {
+            biased;
+
             _ = token.cancelled() => {
                 info!("shutting down");
                 break;
