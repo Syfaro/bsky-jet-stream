@@ -1,0 +1,26 @@
+[package]
+name = "bsky-jet-stream"
+version = "0.1.0"
+edition = "2021"
+authors = ["Syfaro <syfaro@huefox.com>"]
+
+[dependencies]
+async-nats = "0.37.0"
+atrium-api = { version = "0.24.7", default-features = false, features = ["namespace-appbsky"] }
+axum = { version = "0.7.9", default-features = false, features = ["http1", "tokio", "tracing"] }
+chrono = { version = "0.4.38", default-features = false, features = ["serde"] }
+clap = { version = "4.5.21", features = ["derive", "env"] }
+eyre = "0.6.12"
+futures = "0.3.31"
+lazy_static = "1.5.0"
+prometheus = { version = "0.13.4", features = ["process"] }
+serde = { version = "1.0.215", features = ["derive"] }
+serde_json = "1.0.132"
+tap = "1.0.1"
+tokio = { version = "1.41.1", features = ["rt-multi-thread", "macros", "signal"] }
+tokio-tungstenite = { version = "0.24.0", features = ["rustls-tls-webpki-roots", "connect", "url"] }
+tokio-util = "0.7.12"
+tracing = { version = "0.1.40", features = ["release_max_level_debug"] }
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+url = "2.5.3"
+zstd = "0.13.2"
