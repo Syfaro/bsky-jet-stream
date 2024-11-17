@@ -222,7 +222,7 @@ dependencies = [
 
 [[package]]
 name = "bsky-jet-stream"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-nats",
  "axum",
