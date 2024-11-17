@@ -254,7 +254,7 @@ async fn start_jetstream(
 ) -> eyre::Result<()> {
     info!("initializing jetstream connection");
 
-    let dict = DecoderDictionary::copy(&ZSTD_DICTIONARY);
+    let dict = DecoderDictionary::copy(ZSTD_DICTIONARY);
 
     let bucket = js.get_key_value(&config.nats_bucket_name).await?;
 
@@ -350,7 +350,7 @@ fn transform_message(
     data: Vec<u8>,
 ) -> eyre::Result<TransformedMessage> {
     let cursor = Cursor::new(data);
-    let decoder = Decoder::with_prepared_dictionary(cursor, &dict)?;
+    let decoder = Decoder::with_prepared_dictionary(cursor, dict)?;
     let event = serde_json::from_reader::<_, JetstreamEvent>(decoder)?;
 
     trace!(time_us = event.time_us, "got event: {event:?}");
@@ -366,7 +366,7 @@ fn transform_message(
             MESSAGE_KIND_COUNTER.with_label_values(&["commit"]).inc();
 
             COMMIT_ACTION_COUNTER
-                .with_label_values(&[action, commit.collection.as_str()])
+                .with_label_values(&[action, &commit.collection])
                 .inc();
 
             let value = match &commit.data {
@@ -377,13 +377,13 @@ fn transform_message(
 
             let payload = serde_json::json!({
                 "repo": event.did,
-                "path": format!("{}/{}", commit.collection.as_str(), commit.rkey.as_str()),
+                "path": format!("{}/{}", commit.collection, commit.rkey),
                 "action": action,
                 "data": value,
             });
 
             (
-                format!("bsky.ingest.commit.{action}.{}", commit.collection.as_str()),
+                format!("bsky.ingest.commit.{action}.{}", commit.collection),
                 serde_json::to_vec(&payload)?,
             )
         }
