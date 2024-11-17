@@ -2,6 +2,8 @@ name: Docker Images
 
 on:
   push:
+    branches:
+      - 'main'
     tags:
       - '*'
 
@@ -26,19 +28,18 @@ jobs:
           key: ${{ runner.os }}-release-${{ hashFiles('Cargo.lock') }}
 
       - name: Get stable toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
 
       - name: Build binary
-        uses: actions-rs/cargo@v1
+        uses: ronnychevalier/cargo-multivers@main
         with:
-          command: build
-          args: --release
+          out_dir: binaries/
 
       - name: Move binary
         run: |
-          mv target/release/bsky-jet-stream bsky-jet-stream
+          mv binaries/bsky-jet-stream bsky-jet-stream
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
