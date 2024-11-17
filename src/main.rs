@@ -12,7 +12,8 @@ use clap::Parser;
 use futures::StreamExt;
 use lazy_static::lazy_static;
 use prometheus::{
-    register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec, TextEncoder,
+    register_int_counter, register_int_counter_vec, register_int_gauge, IntCounter, IntCounterVec,
+    IntGauge, TextEncoder,
 };
 use serde::{Deserialize, Serialize};
 use tap::TapOptional;
@@ -34,6 +35,9 @@ const ZSTD_DICTIONARY: &[u8] =
 const REPLAY_WINDOW_US: u64 = 5 * 10u64.pow(6);
 
 lazy_static! {
+    static ref RECEIVED_SIZE_COUNTER: IntCounter =
+        register_int_counter!("bsky_nats_size_total", "Number of relevant bytes received.")
+            .unwrap();
     static ref MESSAGES_COUNTER: IntCounter =
         register_int_counter!("bsky_nats_messages_total", "Number of received messages").unwrap();
     static ref MESSAGE_KIND_COUNTER: IntCounterVec = register_int_counter_vec!(
@@ -46,6 +50,11 @@ lazy_static! {
         "bsky_nats_repo_commit_actions_total",
         "Number of received commit actions",
         &["action", "collection"]
+    )
+    .unwrap();
+    static ref LAST_TIMESTAMP: IntGauge = register_int_gauge!(
+        "bsky_nats_last_time_miliseconds",
+        "Last received timestamp."
     )
     .unwrap();
 }
@@ -202,7 +211,7 @@ async fn main() -> eyre::Result<()> {
         }
     }
 
-    debug!("waiting for tasks to finish");
+    info!("waiting for tasks to finish");
     metrics_handle.await??;
     process_handle.await?;
 
@@ -289,9 +298,9 @@ async fn start_jetstream(
     let (stream, _) = connect_async(url).await?;
     info!("connected to stream");
 
-    let mut commit_ticker = interval(Duration::from_secs(10));
-
     let mut pos = cursor;
+
+    let mut commit_ticker = interval(Duration::from_secs(10));
 
     let mut perf_ticker = interval(Duration::from_secs(1));
     let mut start = Instant::now();
@@ -307,13 +316,13 @@ async fn start_jetstream(
         tokio_stream::StreamExt::chunks_timeout(messages_stream, 100, Duration::from_secs(1));
     tokio::pin!(chunked_messages_stream);
 
-    stream_sender(token, stream, bytes_tx).await;
-    transform_thread(config.nats_stream_name.clone(), bytes_rx, messages_tx);
+    let stream_handle = stream_sender(token, stream, bytes_tx).await;
+    let transform_handle = transform_thread(config.nats_stream_name.clone(), bytes_rx, messages_tx);
 
     loop {
         tokio::select! {
             _ = commit_ticker.tick() => {
-                debug!(pos, "committing cursor position");
+                info!(pos, "committing cursor position");
                 bucket.put(&config.nats_cursor_key, pos.to_string().into()).await?;
             }
 
@@ -338,6 +347,8 @@ async fn start_jetstream(
                         ops += len;
 
                         handle_message_chunk(&js, &mut pos, messages).await?;
+
+                        LAST_TIMESTAMP.set((pos / 1000).try_into().unwrap());
                     }
 
                     None => {
@@ -348,6 +359,11 @@ async fn start_jetstream(
             }
         }
     }
+
+    stream_handle.await?;
+    transform_handle
+        .join()
+        .expect("transform handle should join");
 
     info!(pos, "loop finished, saving cursor position");
     bucket
@@ -390,7 +406,7 @@ async fn stream_sender(
     token: CancellationToken,
     stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
     tx: tokio::sync::mpsc::Sender<Result<Vec<u8>, tokio_tungstenite::tungstenite::Error>>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let stream = stream.take_until(token.cancelled());
         tokio::pin!(stream);
@@ -398,6 +414,8 @@ async fn stream_sender(
         while let Some(message) = stream.next().await {
             match message {
                 Ok(Message::Binary(data)) => {
+                    RECEIVED_SIZE_COUNTER.inc_by(data.len() as u64);
+
                     tx.send(Ok(data)).await.expect("send should always succeed");
                 }
 
@@ -413,14 +431,14 @@ async fn stream_sender(
         }
 
         warn!("websocket stream ended");
-    });
+    })
 }
 
 fn transform_thread(
     stream_name: String,
     mut rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, tokio_tungstenite::tungstenite::Error>>,
     tx: tokio::sync::mpsc::Sender<eyre::Result<TransformedMessage>>,
-) {
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let dict = DecoderDictionary::copy(ZSTD_DICTIONARY);
 
@@ -443,7 +461,7 @@ fn transform_thread(
         }
 
         warn!("transform thread ended");
-    });
+    })
 }
 
 struct TransformedMessage {
@@ -451,7 +469,7 @@ struct TransformedMessage {
     data: Option<(String, HeaderMap, Vec<u8>)>,
 }
 
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(time_us, subject))]
 fn transform_message(
     stream_name: &str,
     dict: &DecoderDictionary<'_>,
@@ -465,7 +483,8 @@ fn transform_message(
 
     let event: JetstreamEvent = serde_json::from_slice(&buf)?;
 
-    trace!(time_us = event.time_us, "got event: {event:?}");
+    tracing::Span::current().record("time_us", event.time_us);
+    trace!("got event");
 
     let mut headers = HeaderMap::new();
     headers.insert("Nats-Expected-Stream", stream_name);
@@ -518,6 +537,9 @@ fn transform_message(
             )
         }
     };
+
+    tracing::Span::current().record("subject", &subject);
+    trace!("finished processing event");
 
     Ok(TransformedMessage {
         time_us: event.time_us,
