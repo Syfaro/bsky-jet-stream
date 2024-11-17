@@ -13,14 +13,14 @@ use tap::TapOptional;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, instrument, trace, warn};
 use url::Url;
-use zstd::{dict::DecoderDictionary, Decoder};
+use zstd::Decoder;
 
 const ZSTD_DICTIONARY: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/zstd/dictionary"));
 
-const REPLAY_WINDOW_NS: u64 = 5 * 10u64.pow(6);
+const REPLAY_WINDOW_US: u64 = 5 * 10u64.pow(6);
 
 lazy_static! {
     static ref MESSAGES_COUNTER: IntCounter =
@@ -98,8 +98,14 @@ struct JetstreamCommit {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 enum JetstreamCommitData {
-    Create { record: serde_json::Value, cid: String },
-    Update { record: serde_json::Value, cid: String },
+    Create {
+        record: serde_json::Value,
+        cid: String,
+    },
+    Update {
+        record: serde_json::Value,
+        cid: String,
+    },
     Delete,
 }
 
@@ -244,8 +250,6 @@ async fn start_jetstream(
 ) -> eyre::Result<()> {
     info!("initializing jetstream connection");
 
-    let dict = DecoderDictionary::copy(ZSTD_DICTIONARY);
-
     let bucket = js.get_key_value(&config.nats_bucket_name).await?;
 
     let cursor = if let Some(cursor) = bucket.get(&config.nats_cursor_key).await? {
@@ -253,7 +257,7 @@ async fn start_jetstream(
             .ok()
             .and_then(|str| str.parse::<u64>().ok())
             .tap_some(|cursor| debug!(cursor, "got stored cursor"))
-            .map(|cursor| cursor.saturating_sub(REPLAY_WINDOW_NS))
+            .map(|cursor| cursor.saturating_sub(REPLAY_WINDOW_US))
             .unwrap_or(0)
     } else {
         0
@@ -296,12 +300,12 @@ async fn start_jetstream(
 
                         match message {
                             Message::Binary(data) => {
-                                let message = transform_message(&config.nats_stream_name, &dict, data)?;
+                                let message = transform_message(&config.nats_stream_name, data).await?;
 
                                 pos = message.time_us;
 
                                 if let Some((subject, headers, data)) = message.data {
-                                    js.publish_with_headers(subject, headers, data.into()).await?;
+                                    js.publish_with_headers(subject, headers, data.into()).await?.await?;
                                 }
                             }
 
@@ -333,14 +337,16 @@ struct TransformedMessage {
     data: Option<(String, HeaderMap, Vec<u8>)>,
 }
 
-fn transform_message(
-    stream_name: &str,
-    dict: &DecoderDictionary<'_>,
-    data: Vec<u8>,
-) -> eyre::Result<TransformedMessage> {
-    let cursor = Cursor::new(data);
-    let decoder = Decoder::with_prepared_dictionary(cursor, dict)?;
-    let event = serde_json::from_reader::<_, JetstreamEvent>(decoder)?;
+#[instrument(skip_all)]
+async fn transform_message(stream_name: &str, data: Vec<u8>) -> eyre::Result<TransformedMessage> {
+    let event = tokio::task::spawn_blocking(|| {
+        let cursor = Cursor::new(data);
+        let decoder = Decoder::with_dictionary(cursor, ZSTD_DICTIONARY)?;
+        let event = serde_json::from_reader::<_, JetstreamEvent>(decoder)?;
+
+        Ok::<_, eyre::Report>(event)
+    })
+    .await??;
 
     trace!(time_us = event.time_us, "got event: {event:?}");
 
