@@ -15,7 +15,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, trace, warn};
 use url::Url;
-use zstd::Decoder;
+use zstd::{dict::DecoderDictionary, Decoder};
 
 const ZSTD_DICTIONARY: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/zstd/dictionary"));
@@ -169,7 +169,11 @@ async fn main() -> eyre::Result<()> {
     let js = async_nats::jetstream::new(client);
 
     if js.get_key_value(&config.nats_bucket_name).await.is_err() {
-        eyre::bail!("missing bsky key value bucket");
+        eyre::bail!("missing nats key value bucket: {}", config.nats_bucket_name);
+    }
+
+    if js.get_stream(&config.nats_stream_name).await.is_err() {
+        eyre::bail!("missing nats stream: {}", config.nats_stream_name);
     }
 
     let metrics_handle = tokio::spawn(metrics_server(token.clone(), config.metrics_addr));
@@ -250,6 +254,8 @@ async fn start_jetstream(
 ) -> eyre::Result<()> {
     info!("initializing jetstream connection");
 
+    let dict = DecoderDictionary::copy(&ZSTD_DICTIONARY);
+
     let bucket = js.get_key_value(&config.nats_bucket_name).await?;
 
     let cursor = if let Some(cursor) = bucket.get(&config.nats_cursor_key).await? {
@@ -300,7 +306,7 @@ async fn start_jetstream(
 
                         match message {
                             Message::Binary(data) => {
-                                let message = transform_message(&config.nats_stream_name, data).await?;
+                                let message = transform_message(&config.nats_stream_name, &dict, data)?;
 
                                 pos = message.time_us;
 
@@ -338,15 +344,14 @@ struct TransformedMessage {
 }
 
 #[instrument(skip_all)]
-async fn transform_message(stream_name: &str, data: Vec<u8>) -> eyre::Result<TransformedMessage> {
-    let event = tokio::task::spawn_blocking(|| {
-        let cursor = Cursor::new(data);
-        let decoder = Decoder::with_dictionary(cursor, ZSTD_DICTIONARY)?;
-        let event = serde_json::from_reader::<_, JetstreamEvent>(decoder)?;
-
-        Ok::<_, eyre::Report>(event)
-    })
-    .await??;
+fn transform_message(
+    stream_name: &str,
+    dict: &DecoderDictionary<'_>,
+    data: Vec<u8>,
+) -> eyre::Result<TransformedMessage> {
+    let cursor = Cursor::new(data);
+    let decoder = Decoder::with_prepared_dictionary(cursor, &dict)?;
+    let event = serde_json::from_reader::<_, JetstreamEvent>(decoder)?;
 
     trace!(time_us = event.time_us, "got event: {event:?}");
 
