@@ -165,6 +165,16 @@ enum AccountStatus {
     TakenDown,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct CommitPayload<'a> {
+    repo: String,
+    path: String,
+    action: String,
+    #[serde(borrow)]
+    data: Option<&'a serde_json::value::RawValue>,
+}
+
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     tracing_subscriber::fmt::init();
@@ -508,16 +518,18 @@ fn transform_message(
                 .with_label_values(&[action, &commit.collection])
                 .inc();
 
-            let payload = serde_json::json!({
-                "repo": event.did,
-                "path": format!("{}/{}", commit.collection, commit.rkey),
-                "action": action,
-                "data": commit.record,
-            });
+            trace!("data: {:?}", commit.record);
+
+            let payload = serde_json::to_vec(&CommitPayload {
+                repo: event.did,
+                path: format!("{}/{}", commit.collection, commit.rkey),
+                action: action.to_string(),
+                data: commit.record,
+            })?;
 
             (
                 format!("bsky.ingest.commit.{action}.{}", commit.collection),
-                serde_json::to_vec(&payload)?,
+                payload,
             )
         }
         JetstreamEventKind::Identity => {
