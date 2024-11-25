@@ -169,6 +169,7 @@ enum AccountStatus {
 #[serde(rename_all = "snake_case")]
 struct CommitPayload<'a> {
     repo: String,
+    rev: String,
     path: String,
     action: String,
     #[serde(borrow)]
@@ -522,6 +523,7 @@ fn transform_message(
 
             let payload = serde_json::to_vec(&CommitPayload {
                 repo: event.did,
+                rev: commit.rev,
                 path: format!("{}/{}", commit.collection, commit.rkey),
                 action: action.to_string(),
                 data: commit.record,
